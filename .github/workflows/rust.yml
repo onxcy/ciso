@@ -17,7 +17,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --release && Get-FileHash .\target\release\ciso.exe
+      run: cargo build --release && choco install upx && upx --best .\target\release\ciso.exe && Get-FileHash .\target\release\ciso.exe
     - uses: actions/upload-artifact@v4
       with:
         path: .\target\release\ciso.exe
