@@ -1,104 +1,39 @@
-use std::{ffi::OsStr, process::Command};
-
-use serde::Deserialize;
-use windows::{
-    core::{w, PCWSTR},
-    Win32::{
-        Foundation::{CloseHandle, GENERIC_WRITE},
-        Storage::FileSystem::{
-            CreateFileW, WriteFile, FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH,
-            FILE_SHARE_NONE, OPEN_EXISTING,
-        },
-    },
+use std::{
+    fs::OpenOptions,
+    io::{Read, Write},
+    os::windows::fs::OpenOptionsExt,
+    process::{Command, Stdio},
 };
 
-const KILO: usize = 1024;
-const MEGA: usize = 1024 * KILO;
-const GIGA: usize = 1024 * MEGA;
+const PS_NAME: &str = "powershell";
+const PS_USE_STDIN: &[&str] = &["-Command", "-"];
+const PS_SCRIPT: &[u8] = concat!(include_str!("x.ps1"), '\n').as_bytes();
+const GENERIC_WRITE: u32 = 0x40000000;
+const UEFI_NTFS_IMG: &[u8] = include_bytes!("uefi-ntfs.img");
 
 fn main() {
-    let disk = get_disk().pop().expect("No USB device found.");
-    println!("Using disk {} \"{}\"", disk.id, disk.name);
-
-    clear_disk(&disk);
-    init_disk(&disk);
-
-    part_disk(&disk, 7 * GIGA, 'Q');
-    format_volume_ntfs('Q');
-
-    part_disk(&disk, 1 * MEGA, 'J');
-    write_to_file(w!("\\\\.\\J:"), include_bytes!("uefi-ntfs.img").to_vec());
-}
-
-#[derive(Debug, Deserialize)]
-struct Disk {
-    #[serde(rename = "Number")]
-    id: u32,
-    #[serde(rename = "FriendlyName")]
-    name: String,
-}
-
-fn ps_op2<T>(cmd: impl AsRef<OsStr>, op2: impl FnOnce(&[u8]) -> T) -> T {
-    let output = Command::new("powershell.exe")
-        .arg("-Command")
-        .arg(cmd)
-        .output()
+    let mut ps = Command::new(PS_NAME)
+        .args(PS_USE_STDIN)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .unwrap();
-    assert!(output.status.success());
-    op2(&output.stdout)
-}
-
-fn ps_op(cmd: impl AsRef<OsStr>) {
-    ps_op2(cmd, |_| ())
-}
-
-fn get_disk() -> Vec<Disk> {
-    ps_op2(
-        "ConvertTo-Json @(Get-Disk | Where-Object -Property BusType -eq 'USB' | Select-Object -Property Number,FriendlyName)",
-        |out| serde_json::from_slice(out).unwrap(),
-    )
-}
-
-fn clear_disk(disk: &Disk) {
-    ps_op(format!(
-        "Clear-Disk -Number {} -RemoveData -RemoveOEM -confirm:$false",
-        disk.id
-    ))
-}
-
-fn init_disk(disk: &Disk) {
-    ps_op(format!(
-        "Initialize-Disk -Number {} -PartitionStyle GPT",
-        disk.id
-    ))
-}
-
-fn part_disk(disk: &Disk, size: usize, l: char) {
-    ps_op(format!(
-        "New-Partition -DiskNumber {} -Size {} -DriveLetter {}",
-        disk.id, size, l
-    ))
-}
-
-fn format_volume_ntfs(l: char) {
-    ps_op(format!("Format-Volume -DriveLetter {} -FileSystem NTFS", l))
-}
-
-fn write_to_file(path: PCWSTR, buffer: Vec<u8>) {
-    unsafe {
-        let file = CreateFileW(
-            path,
-            GENERIC_WRITE.0,
-            FILE_SHARE_NONE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAG_WRITE_THROUGH | FILE_FLAG_NO_BUFFERING,
-            None,
-        )
+    ps.stdin.as_mut().unwrap().write_all(PS_SCRIPT).unwrap();
+    assert!(ps.wait().unwrap().success());
+    let mut out = String::new();
+    ps.stdout
+        .as_mut()
+        .unwrap()
+        .read_to_string(&mut out)
         .unwrap();
-        let mut written = 0;
-        WriteFile(file, Some(&buffer), Some(&mut written), None).unwrap();
-        assert_eq!(written as usize, buffer.len());
-        CloseHandle(file).unwrap();
-    }
+    let out = out.trim();
+    let uefi_path = &out[..out.len() - 1];
+    let mut file = OpenOptions::new()
+        .access_mode(GENERIC_WRITE)
+        .share_mode(0)
+        .open(uefi_path)
+        .unwrap();
+    file.write_all(UEFI_NTFS_IMG).unwrap();
+    file.flush().unwrap();
 }
