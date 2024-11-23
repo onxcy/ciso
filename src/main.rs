@@ -1,5 +1,4 @@
-use core::str;
-use std::process::Command;
+use std::{ffi::OsStr, process::Command};
 
 use serde::Deserialize;
 use windows::{
@@ -20,12 +19,15 @@ const GIGA: usize = 1024 * MEGA;
 fn main() {
     let disk = get_disk().pop().expect("No USB device found.");
     println!("Using disk {} \"{}\"", disk.id, disk.name);
+
     clear_disk(&disk);
     init_disk(&disk);
-    part_disk(&disk, 8 * GIGA, 'X');
-    part_disk(&disk, 1 * MEGA, 'Y');
-    format_volume_ntfs('X');
-    write_to_file(w!("\\\\.\\Y:"), include_bytes!("uefi-ntfs.img").to_vec());
+
+    part_disk(&disk, 7 * GIGA, 'Q');
+    format_volume_ntfs('Q');
+
+    part_disk(&disk, 1 * MEGA, 'J');
+    write_to_file(w!("\\\\.\\J:"), include_bytes!("uefi-ntfs.img").to_vec());
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,64 +38,50 @@ struct Disk {
     name: String,
 }
 
-fn ps_op<T>(op1: impl FnOnce(&mut Command) -> &mut Command, op2: impl FnOnce(&[u8]) -> T) -> T {
-    let output = op1(Command::new("powershell.exe").arg("-Command"))
+fn ps_op2<T>(cmd: impl AsRef<OsStr>, op2: impl FnOnce(&[u8]) -> T) -> T {
+    let output = Command::new("powershell.exe")
+        .arg("-Command")
+        .arg(cmd)
         .output()
         .unwrap();
     assert!(output.status.success());
     op2(&output.stdout)
 }
 
+fn ps_op(cmd: impl AsRef<OsStr>) {
+    ps_op2(cmd, |_| ())
+}
+
 fn get_disk() -> Vec<Disk> {
-    ps_op(
-        |cmd| {
-            cmd.arg("ConvertTo-Json @(Get-Disk | Where-Object -Property BusType -eq 'USB' | Select-Object -Property Number,FriendlyName)")
-        },
+    ps_op2(
+        "ConvertTo-Json @(Get-Disk | Where-Object -Property BusType -eq 'USB' | Select-Object -Property Number,FriendlyName)",
         |out| serde_json::from_slice(out).unwrap(),
     )
 }
 
 fn clear_disk(disk: &Disk) {
-    ps_op(
-        |cmd| {
-            cmd.arg(format!(
-                "Clear-Disk -Number {} -RemoveData -RemoveOEM -confirm:$false",
-                disk.id
-            ))
-        },
-        |_| (),
-    )
+    ps_op(format!(
+        "Clear-Disk -Number {} -RemoveData -RemoveOEM -confirm:$false",
+        disk.id
+    ))
 }
 
 fn init_disk(disk: &Disk) {
-    ps_op(
-        |cmd| {
-            cmd.arg(format!(
-                "Initialize-Disk -Number {} -PartitionStyle GPT",
-                disk.id
-            ))
-        },
-        |_| (),
-    )
+    ps_op(format!(
+        "Initialize-Disk -Number {} -PartitionStyle GPT",
+        disk.id
+    ))
 }
 
 fn part_disk(disk: &Disk, size: usize, l: char) {
-    ps_op(
-        |cmd| {
-            cmd.arg(format!(
-                "New-Partition -DiskNumber {} -Size {} -DriveLetter {}",
-                disk.id, size, l
-            ))
-        },
-        |_| (),
-    )
+    ps_op(format!(
+        "New-Partition -DiskNumber {} -Size {} -DriveLetter {}",
+        disk.id, size, l
+    ))
 }
 
 fn format_volume_ntfs(l: char) {
-    ps_op(
-        |cmd| cmd.arg(format!("Format-Volume -DriveLetter {} -FileSystem NTFS", l)),
-        |_| (),
-    )
+    ps_op(format!("Format-Volume -DriveLetter {} -FileSystem NTFS", l))
 }
 
 fn write_to_file(path: PCWSTR, buffer: Vec<u8>) {
