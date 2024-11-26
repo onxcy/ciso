@@ -1,6 +1,13 @@
-$disk = (Get-Disk | Where-Object -Property BusType -EQ 'USB' | Select-Object -Index 0)
-if ($null -eq $disk) { exit 1 }
-$disk | Clear-Disk -RemoveData -RemoveOEM -confirm:$false -PassThru | Initialize-Disk -PartitionStyle GPT | Out-Null
-$size = $disk.Size * 0.95
-$disk | New-Partition -Size $size -AssignDriveLetter | Format-Volume -FileSystem NTFS | Out-Null
-($disk | New-Partition -Size 1MB).AccessPaths
+$disk = (Get-Disk |
+    Where-Object BusType -EQ 'USB' |
+    Select-Object -Index 0 |
+    Clear-Disk -RemoveData -RemoveOEM -PassThru |
+    Initialize-Disk -PartitionStyle GPT -PassThru)
+$ntfs = ($disk | New-Partition -Size 7GB | Format-Volume -FileSystem NTFS)
+$uefi = ($disk | New-Partition -Size 1MB)
+$iso = (Mount-DiskImage $iso_path -NoDriveLetter -PassThru | Get-Volume)
+ConvertTo-Json @{
+    ntfs = $ntfs
+    iso  = $iso
+    uefi = $uefi
+}

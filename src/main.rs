@@ -1,99 +1,93 @@
-use std::{
-    alloc::Layout,
-    fs::{File, OpenOptions},
-    io::{Read, Write},
-    os::windows::fs::OpenOptionsExt,
-    path::Path,
-    process::{Command, Stdio},
-};
+use std::{fs::DirEntry, io::Write, path::Path};
 
-use hex_literal::hex;
-use sha2::{Digest, Sha256};
-
-const PS_NAME: &str = "powershell";
-const PS_USE_STDIN: &[&str] = &["-Command", "-"];
-const PS_SCRIPT: &[u8] = concat!(include_str!("x.ps1"), '\n').as_bytes();
-
-const GENERIC_WRITE: u32 = 0x40000000;
-const GENERIC_READ: u32 = 0x80000000;
-
-const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
-const FILE_FLAG_WRITE_THROUGH: u32 = 0x80000000;
-
-const UEFI_NTFS_IMG: &[u8; 1024 * 1024] = include_bytes!("uefi-ntfs.img");
-const UEFI_NTFS_SHA256: &[u8; 32] =
-    &hex!("25D6BB709B8C952799C0AF3DE29356B33AA64FCBD9A98B3625AC0E806EE49C7B");
-
-const PAGE_ALIGN: usize = 4096;
+use powershell::PowerShell;
+use serde::Deserialize;
 
 fn main() {
-    let out = run_pscmd();
-    let out = out.trim();
-    let uefi_path = &out[..out.len() - 1];
+    let iso_path = std::env::args().skip(1).next().unwrap();
+    let iso_path2 = iso_path.clone();
 
-    img2disk(uefi_path);
-    checkimg(uefi_path);
-}
+    std::panic::set_hook(Box::new(move |info| {
+        PowerShell::new()
+            .no_confirm()
+            .add_variable("iso_path", &iso_path2)
+            .invoke(include_str!("y.ps1"));
+        eprintln!("{}", info.to_string());
+        std::process::exit(1);
+    }));
 
-fn run_pscmd() -> String {
-    let mut ps = Command::new(PS_NAME)
-        .args(PS_USE_STDIN)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let out = PowerShell::new()
+        .no_confirm()
+        .add_variable("iso_path", &iso_path)
+        .invoke(include_str!("x.ps1"));
+    let data: OutData = serde_json::from_slice(&out.stdout).unwrap();
 
-    ps.stdin.as_mut().unwrap().write_all(PS_SCRIPT).unwrap();
-
-    assert!(ps.wait().unwrap().success());
-
-    let mut out = String::new();
-    ps.stdout
-        .as_mut()
+    let uefi_path = data.uefi.access_paths[0].as_str();
+    let uefi_path = &uefi_path[..uefi_path.len() - 1];
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(uefi_path)
         .unwrap()
-        .read_to_string(&mut out)
+        .write_all(include_bytes!("uefi-ntfs.img"))
         .unwrap();
-    out
+
+    let piso = Path::new(&data.iso.path);
+    let pntfs = Path::new(&data.ntfs.path);
+
+    visit_dirs(
+        piso,
+        &|entry| {
+            let p1 = entry.path();
+            let p2 = pntfs.join(p1.strip_prefix(piso).unwrap());
+            std::fs::copy(p1, p2).unwrap();
+        },
+        &|entry| {
+            let p1 = entry.path();
+            let p2 = pntfs.join(p1.strip_prefix(piso).unwrap());
+            std::fs::create_dir_all(p2).unwrap();
+        },
+    )
+    .unwrap();
+
+    PowerShell::new()
+        .no_confirm()
+        .add_variable("iso_path", &iso_path)
+        .invoke(include_str!("y.ps1"));
 }
 
-fn img2disk(path: impl AsRef<Path>) {
-    let buffer = alloc_buffer();
-    buffer.copy_from_slice(UEFI_NTFS_IMG);
-
-    let mut file = open_file(path);
-    let n = file.write(buffer).unwrap();
-
-    assert_eq!(n, UEFI_NTFS_IMG.len());
+#[derive(Debug, Deserialize)]
+struct OutData {
+    ntfs: Volume,
+    iso: Volume,
+    uefi: Partition,
 }
 
-fn checkimg(path: impl AsRef<Path>) {
-    let buffer = alloc_buffer();
-
-    let mut file = open_file(path);
-    let n = file.read(buffer).unwrap();
-
-    assert_eq!(n, UEFI_NTFS_IMG.len());
-
-    let mut hasher = Sha256::new();
-    hasher.update(buffer);
-    assert_eq!(&hasher.finalize()[..], UEFI_NTFS_SHA256);
+#[derive(Debug, Deserialize)]
+struct Volume {
+    #[serde(rename = "Path")]
+    path: String,
 }
 
-fn alloc_buffer() -> &'static mut [u8] {
-    unsafe {
-        let ptr = std::alloc::alloc_zeroed(
-            Layout::from_size_align(UEFI_NTFS_IMG.len(), PAGE_ALIGN).unwrap(),
-        );
-        assert!(!ptr.is_null());
-        std::slice::from_raw_parts_mut(ptr, UEFI_NTFS_IMG.len())
+#[derive(Debug, Deserialize)]
+struct Partition {
+    #[serde(rename = "AccessPaths")]
+    access_paths: [String; 1],
+}
+
+fn visit_dirs(
+    dir: &Path,
+    visit_file: &impl Fn(&DirEntry),
+    visit_dir: &impl Fn(&DirEntry),
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            visit_dir(&entry);
+            visit_dirs(&path, visit_file, visit_dir)?;
+        } else {
+            visit_file(&entry);
+        }
     }
-}
-
-fn open_file(path: impl AsRef<Path>) -> File {
-    OpenOptions::new()
-        .access_mode(GENERIC_READ | GENERIC_WRITE)
-        .share_mode(0)
-        .custom_flags(FILE_FLAG_WRITE_THROUGH | FILE_FLAG_NO_BUFFERING)
-        .open(path)
-        .unwrap()
+    Ok(())
 }
