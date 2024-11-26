@@ -4,15 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sha2 = "0.10.8"
-hex-literal = "0.4.1"
-
-[profile.release]
-opt-level = 3
-debug = false
-strip = true
-debug-assertions = false
-overflow-checks = false
-lto = true
-panic = "abort"
-codegen-units = 1
+powershell = "0.1.1"
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.133"
